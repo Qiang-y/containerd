@@ -321,6 +321,11 @@ func (c *criService) register(s *grpc.Server) error {
 	instrumentedAlpha := newInstrumentedAlphaService(c)
 	runtime_alpha.RegisterRuntimeServiceServer(s, instrumentedAlpha)
 	runtime_alpha.RegisterImageServiceServer(s, instrumentedAlpha)
+
+	// Register custom RestoreContainer RPC (not part of standard CRI proto).
+	// This is a PoC extension for CRIU checkpoint/restore.
+	registerRestoreContainerService(s, c)
+
 	return nil
 }
 

@@ -126,6 +126,15 @@ func (c *criService) StartContainer(ctx context.Context, r *runtime.StartContain
 	if ociRuntime.Path != "" {
 		taskOpts = append(taskOpts, containerd.WithRuntimePath(ociRuntime.Path))
 	}
+
+	// Check if this is a restore from checkpoint.
+	// If the container has a checkpoint annotation, use WithRestoreImagePath
+	// to create the task from the CRIU checkpoint instead of starting fresh.
+	if checkpointPath, ok := cntr.Metadata.Config.GetAnnotations()["io.containerd.checkpoint.restore-path"]; ok && checkpointPath != "" {
+		log.G(ctx).Infof("StartContainer: restoring container %q from checkpoint at %s", id, checkpointPath)
+		taskOpts = append(taskOpts, containerd.WithRestoreImagePath(checkpointPath))
+	}
+
 	task, err := container.NewTask(ctx, ioCreation, taskOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create containerd task: %w", err)
