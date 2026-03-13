@@ -191,7 +191,7 @@ func (p *Init) createCheckpointedState(r *CreateConfig, pidFile *pidFile) error 
 			ImagePath:                r.Checkpoint,
 			WorkDir:                  p.CriuWorkPath,
 			ParentPath:               r.ParentCheckpoint,
-			AllowOpenTCP:             true, // --tcp-established: allow restoring established TCP connections
+			AllowOpenTCP:             true, // --tcp-established: allow checkpointing/restoring established TCP connections
 			AllowExternalUnixSockets: true, // --ext-unix-sk: allow restoring external unix sockets
 			FileLocks:                true, // --file-locks: allow restoring file locks
 		},
