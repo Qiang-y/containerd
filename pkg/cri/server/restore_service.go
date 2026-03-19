@@ -19,17 +19,26 @@ package server
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	"github.com/containerd/containerd/log"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 // RestoreContainerRequest is the request message for RestoreContainer RPC.
-// It mirrors CheckpointContainerRequest from CRI v1 proto for simplicity.
+// It mirrors CheckpointContainerRequest from CRI v1 proto for simplicity,
+// with v2 extensions for sandbox netns mapping.
 type RestoreContainerRequest struct {
-	ContainerId string `protobuf:"bytes,1,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
-	Location    string `protobuf:"bytes,2,opt,name=location,proto3" json:"location,omitempty"`
-	Timeout     int64  `protobuf:"varint,3,opt,name=timeout,proto3" json:"timeout,omitempty"`
+	ContainerId     string `protobuf:"bytes,1,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
+	Location        string `protobuf:"bytes,2,opt,name=location,proto3" json:"location,omitempty"`
+	Timeout         int64  `protobuf:"varint,3,opt,name=timeout,proto3" json:"timeout,omitempty"`
+	// v2: Path to the new sandbox's network namespace (e.g. /proc/<sandbox_pid>/ns/net).
+	// Empty means no netns mapping (v1 mode: sandbox preserved).
+	SandboxNetnsPath string `protobuf:"bytes,4,opt,name=sandbox_netns_path,json=sandboxNetnsPath,proto3" json:"sandbox_netns_path,omitempty"`
+	// v2: Inode number of the old netns recorded during checkpoint.
+	// Zero means no netns mapping.
+	OldNetnsInode    uint64 `protobuf:"varint,5,opt,name=old_netns_inode,json=oldNetnsInode,proto3" json:"old_netns_inode,omitempty"`
 }
 
 func (m *RestoreContainerRequest) Reset()         { *m = RestoreContainerRequest{} }
@@ -50,9 +59,26 @@ type restoreContainerHandler struct {
 
 // RestoreContainer handles the RestoreContainer gRPC call.
 func (h *restoreContainerHandler) RestoreContainer(ctx context.Context, req *RestoreContainerRequest) (*RestoreContainerResponse, error) {
-	log.G(ctx).Infof("RestoreContainer gRPC handler called: containerID=%s, location=%s", req.ContainerId, req.Location)
+	// v2: Read sandboxNetnsPath and oldNetnsInode from gRPC metadata headers.
+	// These cannot be reliably passed via proto struct tags across different proto libraries,
+	// so we use gRPC metadata as a workaround.
+	sandboxNetnsPath := req.SandboxNetnsPath
+	oldNetnsInode := req.OldNetnsInode
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if vals := md.Get("x-criu-sandbox-netns-path"); len(vals) > 0 && vals[0] != "" {
+			sandboxNetnsPath = vals[0]
+		}
+		if vals := md.Get("x-criu-old-netns-inode"); len(vals) > 0 {
+			if inode, err := strconv.ParseUint(vals[0], 10, 64); err == nil {
+				oldNetnsInode = inode
+			}
+		}
+	}
 
-	if err := h.cri.RestoreContainer(ctx, req.ContainerId, req.Location); err != nil {
+	log.G(ctx).Infof("RestoreContainer gRPC handler called: containerID=%s, location=%s, sandboxNetnsPath=%s, oldNetnsInode=%d",
+		req.ContainerId, req.Location, sandboxNetnsPath, oldNetnsInode)
+
+	if err := h.cri.RestoreContainer(ctx, req.ContainerId, req.Location, sandboxNetnsPath, oldNetnsInode); err != nil {
 		log.G(ctx).WithError(err).Errorf("RestoreContainer failed for container %s", req.ContainerId)
 		return nil, err
 	}

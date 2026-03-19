@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/containerd/containerd"
@@ -28,6 +29,8 @@ import (
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/nri"
 	v1 "github.com/containerd/nri/types/v1"
+	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/containerd/typeurl"
 	"golang.org/x/net/context"
 
 	cio "github.com/containerd/containerd/pkg/cri/io"
@@ -43,9 +46,23 @@ import (
 // The restore process:
 // 1. Verify the container exists and was previously checkpointed
 // 2. Delete the old (exited) task if it exists
-// 3. Create a new task from the CRIU checkpoint using WithRestoreImagePath
-// 4. Start the restored task
-func (c *criService) RestoreContainer(ctx context.Context, containerID string, checkpointPath string) error {
+// 3. (v2) If sandboxNetnsPath + oldNetnsInode are provided:
+//    a. Generate a temporary CRIU config file with `tcp-close` + `external net[<old>]:netns[<new>]`
+//    b. Update the container's OCI spec annotations with `org.criu.config=<config_file>`
+//    c. runc reads the annotation, passes the config file to CRIU via RPC ConfigFile
+// 4. Create a new task from the CRIU checkpoint using WithRestoreImagePath
+// 5. Start the restored task
+// 6. Clean up: remove temporary config file, restore original annotations
+//
+// Parameters:
+//   - containerID: the container to restore
+//   - checkpointPath: path to the CRIU checkpoint directory
+//   - sandboxNetnsPath: (v2) path to the new sandbox's network namespace (e.g. /proc/<sandbox_pid>/ns/net).
+//     Empty string means no netns mapping (v1 mode: sandbox was preserved).
+//   - oldNetnsInode: (v2) the inode number of the old netns recorded during checkpoint.
+//     Zero means no netns mapping.
+func (c *criService) RestoreContainer(ctx context.Context, containerID string, checkpointPath string,
+	sandboxNetnsPath string, oldNetnsInode uint64) error {
 	start := time.Now()
 
 	// Get the container from store
@@ -59,7 +76,8 @@ func (c *criService) RestoreContainer(ctx context.Context, containerID string, c
 	container := cntr.Container
 	config := meta.Config
 
-	log.G(ctx).Infof("RestoreContainer: starting restore for container %q from %s", id, checkpointPath)
+	log.G(ctx).Infof("RestoreContainer: starting restore for container %q from %s (sandboxNetnsPath=%s, oldNetnsInode=%d)",
+		id, checkpointPath, sandboxNetnsPath, oldNetnsInode)
 
 	// Verify checkpoint files exist
 	if _, err := os.Stat(checkpointPath); os.IsNotExist(err) {
@@ -72,12 +90,26 @@ func (c *criService) RestoreContainer(ctx context.Context, containerID string, c
 
 	// Get sandbox config from sandbox store
 	sandbox, err := c.sandboxStore.Get(meta.SandboxID)
+	sandboxAvailable := (err == nil)
 	if err != nil {
-		return fmt.Errorf("sandbox %q not found: %w", meta.SandboxID, err)
+		// v2: If sandboxNetnsPath is provided, the old sandbox may have been destroyed.
+		// The caller (kubelet) has already created a new sandbox and confirmed it's ready.
+		if sandboxNetnsPath != "" {
+			log.G(ctx).Infof("RestoreContainer: old sandbox %q not found (expected in v2 mode), proceeding with netns mapping", meta.SandboxID)
+		} else {
+			return fmt.Errorf("sandbox %q not found: %w", meta.SandboxID, err)
+		}
 	}
 	sandboxID := meta.SandboxID
-	if sandbox.Status.Get().State != sandboxstore.StateReady {
-		return fmt.Errorf("sandbox container %q is not running", sandboxID)
+	// v2: Skip sandbox state check when sandboxNetnsPath is provided.
+	if sandboxNetnsPath == "" {
+		// v1 mode: sandbox must be running
+		if sandboxAvailable && sandbox.Status.Get().State != sandboxstore.StateReady {
+			return fmt.Errorf("sandbox container %q is not running", sandboxID)
+		}
+	} else {
+		log.G(ctx).Infof("RestoreContainer: v2 mode — skipping sandbox state check (old sandbox %q may be NotReady, new netns=%s)",
+			sandboxID, sandboxNetnsPath)
 	}
 
 	// Delete old task if it exists (checkpoint leaves the task in exited state)
@@ -90,6 +122,18 @@ func (c *criService) RestoreContainer(ctx context.Context, containerID string, c
 	} else if !errdefs.IsNotFound(err) {
 		return fmt.Errorf("failed to check task for container %q: %w", id, err)
 	}
+
+	// ===== v2: Generate temporary CRIU config file and set org.criu.config annotation =====
+	var criuConfigPath string
+	if sandboxNetnsPath != "" && oldNetnsInode > 0 {
+		criuConfigPath, err = c.setupCriuRestoreConfig(ctx, container, id, sandboxNetnsPath, oldNetnsInode)
+		if err != nil {
+			return fmt.Errorf("failed to setup CRIU restore config for container %q: %w", id, err)
+		}
+		// Ensure cleanup of the temporary config file and annotation restoration
+		defer c.cleanupCriuRestoreConfig(ctx, container, id, criuConfigPath)
+	}
+	// ===== end v2 =====
 
 	// Close old I/O (the old container's FIFO pipes are already closed/EOF)
 	if cntr.IO != nil {
@@ -122,15 +166,17 @@ func (c *criService) RestoreContainer(ctx context.Context, containerID string, c
 		return fmt.Errorf("failed to get container info: %w", err)
 	}
 
-	ociRuntime, err := c.getSandboxRuntime(sandbox.Config, sandbox.Metadata.RuntimeHandler)
-	if err != nil {
-		return fmt.Errorf("failed to get sandbox runtime: %w", err)
-	}
-
 	// Build task options with checkpoint restore path
 	taskOpts := c.taskOpts(ctrInfo.Runtime.Name)
-	if ociRuntime.Path != "" {
-		taskOpts = append(taskOpts, containerd.WithRuntimePath(ociRuntime.Path))
+	// Get OCI runtime path from sandbox config (if available)
+	if sandboxAvailable {
+		ociRuntime, err := c.getSandboxRuntime(sandbox.Config, sandbox.Metadata.RuntimeHandler)
+		if err != nil {
+			return fmt.Errorf("failed to get sandbox runtime: %w", err)
+		}
+		if ociRuntime.Path != "" {
+			taskOpts = append(taskOpts, containerd.WithRuntimePath(ociRuntime.Path))
+		}
 	}
 	// Key: use WithRestoreImagePath to restore from CRIU checkpoint
 	taskOpts = append(taskOpts, containerd.WithRestoreImagePath(checkpointPath))
@@ -157,9 +203,13 @@ func (c *criService) RestoreContainer(ctx context.Context, containerID string, c
 		log.G(ctx).WithError(err).Error("unable to create nri client")
 	}
 	if nric != nil {
+		var sandboxLabels map[string]string
+		if sandboxAvailable {
+			sandboxLabels = sandbox.Config.Labels
+		}
 		nriSB := &nri.Sandbox{
 			ID:     sandboxID,
-			Labels: sandbox.Config.Labels,
+			Labels: sandboxLabels,
 		}
 		if _, err := nric.InvokeWithSandbox(ctx, task, v1.Create, nriSB); err != nil {
 			task.Delete(ctx, containerd.WithProcessKill)
@@ -193,6 +243,150 @@ func (c *criService) RestoreContainer(ctx context.Context, containerID string, c
 	log.G(ctx).Infof("RestoreContainer: restore completed for container %q in %v, new pid=%d", id, elapsed, task.Pid())
 
 	return nil
+}
+
+// setupCriuRestoreConfig generates a temporary CRIU config file and updates the container's
+// OCI spec annotations with org.criu.config pointing to the config file.
+//
+// This implements "方案 A" for passing CRIU --external net[...] parameter:
+//   1. Write a temp config file with `tcp-close` and `external net[<old_inode>]:netns[<new_path>]`
+//   2. Update the container's OCI spec to add `org.criu.config=<config_file_path>` annotation
+//   3. When runc reads the OCI config.json during restore, it finds the annotation
+//   4. runc's handleCriuConfigurationFile() sets rpcOpts.ConfigFile to our config file
+//   5. CRIU reads the config file and gets the --external and --tcp-close options
+//
+// The config file has highest priority (RPC config_file overrides /etc/criu/runc.conf).
+func (c *criService) setupCriuRestoreConfig(ctx context.Context, container containerd.Container,
+	containerID string, sandboxNetnsPath string, oldNetnsInode uint64) (string, error) {
+
+	// 1. Generate the temporary CRIU config file
+	criuConfigPath := filepath.Join(os.TempDir(), fmt.Sprintf("criu-restore-%s.conf", containerID))
+	configContent := fmt.Sprintf(
+		"# CRIU restore config for container %s (auto-generated, will be cleaned up)\n"+
+			"tcp-close\n"+
+			"external net[%d]:netns[%s]\n",
+		containerID, oldNetnsInode, sandboxNetnsPath,
+	)
+
+	if err := os.WriteFile(criuConfigPath, []byte(configContent), 0644); err != nil {
+		return "", fmt.Errorf("failed to write CRIU config file %s: %w", criuConfigPath, err)
+	}
+	log.G(ctx).Infof("RestoreContainer: wrote CRIU config file %s: tcp-close + external net[%d]:netns[%s]",
+		criuConfigPath, oldNetnsInode, sandboxNetnsPath)
+
+	// 2. Update the container's OCI spec annotations with org.criu.config
+	//    This follows the same pattern as sandbox_run.go which updates container spec after network setup.
+	ctrInfo, err := container.Info(ctx)
+	if err != nil {
+		os.Remove(criuConfigPath)
+		return "", fmt.Errorf("failed to get container info: %w", err)
+	}
+
+	spec := &runtimespec.Spec{}
+	if err := typeurl.UnmarshalTo(ctrInfo.Spec, spec); err != nil {
+		os.Remove(criuConfigPath)
+		return "", fmt.Errorf("failed to unmarshal container spec: %w", err)
+	}
+
+	// Add org.criu.config annotation
+	if spec.Annotations == nil {
+		spec.Annotations = make(map[string]string)
+	}
+	spec.Annotations["org.criu.config"] = criuConfigPath
+
+	// v2: Update ALL namespace paths in OCI spec that point to the old (destroyed) sandbox's /proc/<old_pid>/ns/.
+	// The old sandbox process is gone, so /proc/<old_pid>/ns/{net,ipc,uts} no longer exist.
+	// We need to rewrite them to use the new sandbox's PID. The sandboxNetnsPath is like /proc/<new_pid>/ns/net,
+	// so we extract the new sandbox PID from it and replace old PID in all namespace paths.
+	if spec.Linux != nil {
+		// Extract new sandbox PID from sandboxNetnsPath (format: /proc/<pid>/ns/net)
+		newSandboxPid := ""
+		parts := strings.Split(sandboxNetnsPath, "/")
+		if len(parts) >= 4 && parts[1] == "proc" && parts[3] == "ns" {
+			newSandboxPid = parts[2]
+		}
+
+		if newSandboxPid != "" {
+			for i, ns := range spec.Linux.Namespaces {
+				if ns.Path == "" {
+					continue
+				}
+				// Check if this namespace path is a /proc/<pid>/ns/<type> path
+				nsParts := strings.Split(ns.Path, "/")
+				if len(nsParts) >= 4 && nsParts[1] == "proc" && nsParts[3] == "ns" {
+					oldPid := nsParts[2]
+					if oldPid != newSandboxPid {
+						// Replace old PID with new sandbox PID
+						nsParts[2] = newSandboxPid
+						newPath := strings.Join(nsParts, "/")
+						log.G(ctx).Infof("RestoreContainer: updated OCI spec %s namespace path: %s -> %s",
+							ns.Type, ns.Path, newPath)
+						spec.Linux.Namespaces[i].Path = newPath
+					}
+				}
+			}
+		} else {
+			log.G(ctx).Warnf("RestoreContainer: could not extract sandbox PID from sandboxNetnsPath %q, only updating network ns", sandboxNetnsPath)
+			for i, ns := range spec.Linux.Namespaces {
+				if ns.Type == runtimespec.NetworkNamespace {
+					oldPath := ns.Path
+					spec.Linux.Namespaces[i].Path = sandboxNetnsPath
+					log.G(ctx).Infof("RestoreContainer: updated OCI spec network namespace path: %s -> %s", oldPath, sandboxNetnsPath)
+					break
+				}
+			}
+		}
+	}
+
+	// Update the container with the modified spec
+	if err := container.Update(ctx,
+		containerd.UpdateContainerOpts(containerd.WithSpec(spec)),
+	); err != nil {
+		os.Remove(criuConfigPath)
+		return "", fmt.Errorf("failed to update container spec with org.criu.config annotation: %w", err)
+	}
+	log.G(ctx).Infof("RestoreContainer: set org.criu.config=%s on container %q OCI spec", criuConfigPath, containerID)
+
+	return criuConfigPath, nil
+}
+
+// cleanupCriuRestoreConfig removes the temporary CRIU config file and restores the container's
+// OCI spec by removing the org.criu.config annotation.
+func (c *criService) cleanupCriuRestoreConfig(ctx context.Context, container containerd.Container,
+	containerID string, criuConfigPath string) {
+
+	// 1. Remove the temporary config file
+	if err := os.Remove(criuConfigPath); err != nil && !os.IsNotExist(err) {
+		log.G(ctx).WithError(err).Warnf("RestoreContainer: failed to remove CRIU config file %s", criuConfigPath)
+	} else {
+		log.G(ctx).Infof("RestoreContainer: cleaned up CRIU config file %s", criuConfigPath)
+	}
+
+	// 2. Remove org.criu.config annotation from container spec
+	//    This ensures the annotation doesn't persist and affect future operations
+	//    (e.g., if the container is checkpointed again and restored without netns mapping)
+	ctrInfo, err := container.Info(ctx)
+	if err != nil {
+		log.G(ctx).WithError(err).Warn("RestoreContainer: failed to get container info for annotation cleanup")
+		return
+	}
+
+	spec := &runtimespec.Spec{}
+	if err := typeurl.UnmarshalTo(ctrInfo.Spec, spec); err != nil {
+		log.G(ctx).WithError(err).Warn("RestoreContainer: failed to unmarshal spec for annotation cleanup")
+		return
+	}
+
+	if _, ok := spec.Annotations["org.criu.config"]; ok {
+		delete(spec.Annotations, "org.criu.config")
+		if err := container.Update(ctx,
+			containerd.UpdateContainerOpts(containerd.WithSpec(spec)),
+		); err != nil {
+			log.G(ctx).WithError(err).Warn("RestoreContainer: failed to remove org.criu.config annotation")
+		} else {
+			log.G(ctx).Infof("RestoreContainer: removed org.criu.config annotation from container %q", containerID)
+		}
+	}
 }
 
 // GetCheckpointPath returns the checkpoint path for a container, or empty string if not checkpointed.
